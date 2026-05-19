@@ -1,0 +1,221 @@
+name: build-grammars
+
+# Compile each WASM grammar helm ships at runtime, bundle it with its
+# upstream `queries/highlights.scm`, and publish one `.tar.gz` per
+# language to a GitHub Release. The helm client (`grammar_store`)
+# downloads from this release on demand — see README "Grammar source
+# policy" + `crates/helm-gui/src/services/grammar_store.rs`.
+#
+# Runs:
+#   - manually (`workflow_dispatch`)
+#   - on any push to `main` that touches `crates/helm-gui/Cargo.toml`
+#     (tree-sitter ABI bumps re-roll the whole set).
+#
+# Cost: ubuntu-latest, ~5-10 min per run. Failed-grammar policy: if a
+# single grammar fails to build, the matrix entry fails BUT
+# fail-fast: false lets the rest still publish. Remove the failing
+# grammar from the matrix on the next pass.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/helm-gui/Cargo.toml'
+      - '.github/workflows/build-grammars.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-grammars-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pin tree-sitter CLI to match the runtime ABI used by the helm
+  # client. helm-gui depends on `tree-sitter = "0.23"` (ABI 14); CLI
+  # 0.22.x emits ABI 14 by default. Bump in lockstep with the Rust
+  # crate to avoid loader-vs-parser version drift.
+  TREE_SITTER_CLI_VERSION: '0.22.6'
+  # Date stamp used as the release tag. Must match
+  # `HELM_GRAMMARS_RELEASE_TAG` in
+  # `crates/helm-gui/src/services/grammar_store.rs`.
+  RELEASE_TAG: grammars-2026-05-19
+
+jobs:
+  build:
+    name: build ${{ matrix.grammar.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # One grammar fails → the others still publish. Keeps the
+      # release useful even when an upstream regression breaks one
+      # language.
+      fail-fast: false
+      matrix:
+        # Each entry:
+        #   name:  canonical name used by `grammar_for_extension`
+        #   repo:  https://github.com/<owner>/<repo>(@ref)
+        #   path:  optional subdir inside the repo where the grammar
+        #          lives (multi-grammar repos like tree-sitter-php).
+        #   query: optional path inside the repo to the highlights
+        #          query. Defaults to `queries/highlights.scm`.
+        grammar:
+          # C family
+          - { name: c-sharp,    repo: tree-sitter/tree-sitter-c-sharp }
+          - { name: cpp,        repo: tree-sitter/tree-sitter-cpp }
+          - { name: c,          repo: tree-sitter/tree-sitter-c }
+          - { name: java,       repo: tree-sitter/tree-sitter-java }
+          - { name: swift,      repo: alex-pinkus/tree-sitter-swift }
+          # Scripting
+          - { name: ruby,       repo: tree-sitter/tree-sitter-ruby }
+          - { name: lua,        repo: tree-sitter-grammars/tree-sitter-lua }
+          - { name: perl,       repo: tree-sitter-perl/tree-sitter-perl }
+          - { name: r,          repo: r-lib/tree-sitter-r }
+          - { name: julia,      repo: tree-sitter/tree-sitter-julia }
+          # Functional / JVM-adjacent
+          - { name: scala,      repo: tree-sitter/tree-sitter-scala }
+          - { name: elixir,     repo: elixir-lang/tree-sitter-elixir }
+          - { name: erlang,     repo: WhatsApp/tree-sitter-erlang }
+          - { name: haskell,    repo: tree-sitter/tree-sitter-haskell }
+          - { name: ocaml,      repo: tree-sitter/tree-sitter-ocaml,         path: grammars/ocaml }
+          - { name: clojure,    repo: sogaiu/tree-sitter-clojure }
+          # Systems / modern
+          - { name: zig,        repo: tree-sitter-grammars/tree-sitter-zig }
+          - { name: dart,       repo: UserNobody14/tree-sitter-dart }
+          # Infra / config
+          - { name: nix,        repo: nix-community/tree-sitter-nix }
+          - { name: terraform,  repo: MichaHoffmann/tree-sitter-hcl,         path: . }
+          - { name: hcl,        repo: MichaHoffmann/tree-sitter-hcl }
+          - { name: ini,        repo: justinmk/tree-sitter-ini }
+          # Frontend frameworks
+          - { name: vue,        repo: tree-sitter-grammars/tree-sitter-vue }
+          - { name: svelte,     repo: tree-sitter-grammars/tree-sitter-svelte }
+          - { name: graphql,    repo: bkegley/tree-sitter-graphql }
+          - { name: prisma,     repo: victorhqc/tree-sitter-prisma }
+          # Misc
+          - { name: sql,        repo: DerekStride/tree-sitter-sql }
+          - { name: vim,        repo: tree-sitter-grammars/tree-sitter-vim }
+          - { name: xml,        repo: tree-sitter-grammars/tree-sitter-xml,  path: xml }
+          - { name: regex,      repo: tree-sitter/tree-sitter-regex }
+    steps:
+      - name: Install tree-sitter CLI
+        run: |
+          set -euo pipefail
+          npm install -g tree-sitter-cli@${TREE_SITTER_CLI_VERSION}
+          tree-sitter --version
+
+      - name: Install emscripten (for --wasm)
+        # tree-sitter build --wasm shells out to emcc. The CLI's
+        # vendored docker fallback is slower + flakier on CI than
+        # installing emsdk directly.
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.55
+          actions-cache-folder: emsdk-cache
+
+      - name: Clone grammar repo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/grammar
+          cd /tmp/grammar
+          git clone --depth 1 "https://github.com/${{ matrix.grammar.repo }}.git" src
+
+      - name: Build WASM
+        run: |
+          set -euo pipefail
+          NAME='${{ matrix.grammar.name }}'
+          GRAMMAR_PATH='${{ matrix.grammar.path }}'
+          SRC_DIR=/tmp/grammar/src
+          if [[ -n "$GRAMMAR_PATH" && "$GRAMMAR_PATH" != "." ]]; then
+            SRC_DIR="$SRC_DIR/$GRAMMAR_PATH"
+          fi
+          cd "$SRC_DIR"
+          # Some grammar repos don't ship `src/parser.c`; regenerate
+          # from `grammar.js` first. Cheap no-op when parser.c exists.
+          if [[ ! -f src/parser.c && -f grammar.js ]]; then
+            tree-sitter generate
+          fi
+          tree-sitter build --wasm --output "/tmp/tree-sitter-${NAME}.wasm" .
+          ls -lh "/tmp/tree-sitter-${NAME}.wasm"
+          # Sanity: must start with the WASM magic bytes (`\0asm`).
+          head -c 4 "/tmp/tree-sitter-${NAME}.wasm" | xxd | grep -q '0061 736d' \
+            || (echo "::error::not a wasm module" && exit 1)
+
+      - name: Stage tarball contents
+        run: |
+          set -euo pipefail
+          NAME='${{ matrix.grammar.name }}'
+          GRAMMAR_PATH='${{ matrix.grammar.path }}'
+          SRC_DIR=/tmp/grammar/src
+          if [[ -n "$GRAMMAR_PATH" && "$GRAMMAR_PATH" != "." ]]; then
+            SRC_DIR="$SRC_DIR/$GRAMMAR_PATH"
+          fi
+          STAGE="/tmp/stage-${NAME}"
+          mkdir -p "$STAGE"
+          cp "/tmp/tree-sitter-${NAME}.wasm" "$STAGE/"
+          # Prefer the grammar-local queries/highlights.scm; fall
+          # back to the repo root if the multi-grammar repo only
+          # vendors one. Missing query is non-fatal — the client
+          # renders plain text when the .scm is absent.
+          if [[ -f "$SRC_DIR/queries/highlights.scm" ]]; then
+            cp "$SRC_DIR/queries/highlights.scm" "$STAGE/"
+          elif [[ -f /tmp/grammar/src/queries/highlights.scm ]]; then
+            cp /tmp/grammar/src/queries/highlights.scm "$STAGE/"
+          else
+            echo "::warning::no highlights.scm found for $NAME"
+          fi
+          ls -lh "$STAGE"
+
+      - name: Pack tarball
+        run: |
+          set -euo pipefail
+          NAME='${{ matrix.grammar.name }}'
+          tar -czf "/tmp/tree-sitter-${NAME}.tar.gz" -C "/tmp/stage-${NAME}" .
+          ls -lh "/tmp/tree-sitter-${NAME}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grammar-${{ matrix.grammar.name }}
+          path: /tmp/tree-sitter-${{ matrix.grammar.name }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    # Run even if some matrix entries failed — publish what we have,
+    # rather than letting one broken upstream block the whole batch.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download all grammar tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/grammars
+          pattern: grammar-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh /tmp/grammars
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Grammars ${{ env.RELEASE_TAG }}
+          body: |
+            Pre-built WASM tree-sitter grammars consumed by
+            `services::grammar_store` at runtime.
+
+            Each `tree-sitter-<lang>.tar.gz` contains:
+
+            - `tree-sitter-<lang>.wasm`
+            - `highlights.scm`
+
+            Built by `.github/workflows/build-grammars.yml`. See
+            README "Grammar source policy" for context.
+          files: /tmp/grammars/*.tar.gz
+          fail_on_unmatched_files: true
